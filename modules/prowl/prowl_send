@@ -1,0 +1,76 @@
+#!/bin/bash 
+
+
+dir=$( cd "$( dirname "$0" )" && cd ../../ && pwd )
+date=`date +%y%m%d-%H%M%S`
+
+# Support for sending notifications via Prowl
+# https://www.prowlapp.com/
+# Most of the code/logic here was borrowed from the existing sms_send
+
+# Get the api keys from a tmp file until we can fetch them from the database
+# Keys should be comma separated on a single line in the file
+apikeys="`cat $dir/tmp/prowl-apikeys`"
+if [ ${#apikeys} -lt 40 ]; then
+    echo 'API key(s) missing or too short'
+    exit
+fi
+
+temp_scale=`sqlite3 -cmd ".timeout 2000" $dir/dbf/nettemp.db "SELECT temp_scale FROM settings"`
+
+check_alarm() {
+for line in `sqlite3 -cmd ".timeout 2000" $dir/dbf/nettemp.db "SELECT name,tmp,tmp_min,tmp_max,type FROM sensors WHERE alarm='on'"| sed 's/ /_/g'`; 
+do
+    name=`echo $line | awk 'BEGIN {FS="|"}{print $1}'`
+    tmp=`echo $line | awk 'BEGIN {FS="|"}{print $2}'`
+    tmp_min=`echo $line | awk 'BEGIN {FS="|"}{print $3}'`
+    tmp_max=`echo $line | awk 'BEGIN {FS="|"}{print $4}'`
+    type=$(echo $line | awk 'BEGIN {FS="|"}{print $5}' | sed 's/|/ /g' | sed 's/press/hPa/g' | sed "s/temp/$temp_scale/g" | sed 's/humid/%/g' | sed 's/volt/V/g' | sed 's/amps/A/g' | sed 's/watt/W/g' | sed 's/water/m3/g' | sed 's/gas/m3/g' | sed 's/elec/kWh/g')
+
+    sent=$dir/tmp/prowl-sent-$name
+
+    echo "$name $tmp $tmp_min $tmp_max $type"
+
+    if [ -n "$tmp_max" ]; then
+        cr_ge=$(echo $tmp $tmp_max | awk '{if ($1 >= $2) print 1; else print 0 }')
+    else
+        if grep -q -s HIGH $sent; then
+            rm -f $sent
+            echo "clear HIGH $sent"
+        fi
+        cr_ge=0;
+    fi
+
+    if [ -n "$tmp_min" ]; then
+        cr_le=$(echo $tmp $tmp_min | awk '{if ($1 <= $2) print 1; else print 0 }')
+    else
+        if  grep -q -s LOW $sent; then
+            rm -f $sent
+            echo "clear LOW $sent"
+        fi
+        cr_le=0
+    fi
+
+    if [[ ! -f $sent ]] || grep -q -s RECOVERY $sent; then
+        if [[ $cr_ge == 1 ]]; then
+            echo "HIGH $name $tmp $type" > $sent;
+            curl -k -d apikey="$apikeys" -d application="Nettemp - `hostname`" -d event="`cat $sent`" https://api.prowlapp.com/publicapi/add
+            echo "Send HIGH $sent"
+        fi
+        if [[ $cr_le == 1 ]]; then
+            echo "LOW $name $tmp $type" > $sent;
+            curl -k -d apikey="$apikeys" -d application="Nettemp - `hostname`" -d event="`cat $sent`" https://api.prowlapp.com/publicapi/add
+            echo "Send LOW $sent"
+        fi
+    elif  ! grep -q -s RECOVERY $sent && [[ $cr_ge == 0 ]] && [[ $cr_le == 0 ]]; then
+        echo "RECOVERY $name $tmp $type" > $sent;
+        curl -k -d apikey="$apikeys" -d application="Nettemp - `hostname`" -d event="`cat $sent`" https://api.prowlapp.com/publicapi/add
+        echo "Send RECOVERY $sent"
+    else
+        echo "Already sent $sent"
+    fi
+done
+}
+
+
+check_alarm
